@@ -28,7 +28,43 @@ PHYSICAL_HEIGHT = 600
 BLOCK_SIZE = 4 # 4x4 physical pixel block represents one logical pixel
 BORDER_COLOR_6BIT_VALUE = 48 # Index for (255, 0, 0) in COLOR_PALETTE
 SEPARATOR_VALUE = 63
-SEPARATOR_LENGTH = 4
+
+# Technical Information Constants (copied from encoder.py)
+ENCODER_VERSION = 1
+ENCODING_CP1251_ID = 0
+ENCODING_UTF8_ID = 1 # New ID for UTF-8
+COMPRESSOR_LZMA_ID = 1
+COMPRESSOR_NONE_ID = 0 # Not used in current implementation, but good to define
+
+# Helper function to convert a byte array to a list of 6-bit integer chunks (copied from encoder.py)
+def _bytes_to_6bit_chunks(byte_array):
+    binary_string = ''.join(bin(byte_val)[2:].zfill(8) for byte_val in byte_array)
+    six_bit_chunks = []
+    for i in range(0, len(binary_string), 6):
+        chunk = binary_string[i:i+6]
+        six_bit_chunks.append(int(chunk.ljust(6, '0'), 2))
+    return six_bit_chunks
+
+# Generate the 10-byte technical data block (copied from encoder.py)
+def _generate_technical_data_bytes(encoding_id, compressor_id):
+    tech_data = bytearray(10)
+    tech_data[0] = ENCODER_VERSION
+    tech_data[1] = encoding_id
+    tech_data[2] = compressor_id
+    # Bytes 3-9 are reserved (default to 0)
+    return tech_data
+
+# Generate the full separator as a list of 6-bit chunks (copied from encoder.py)
+def _generate_full_separator_chunks(encoding_id, compressor_id):
+    separator_start_bytes = bytearray([SEPARATOR_VALUE, SEPARATOR_VALUE])
+    separator_end_bytes = bytearray([SEPARATOR_VALUE, SEPARATOR_VALUE])
+    
+    tech_data_bytes = _generate_technical_data_bytes(encoding_id, compressor_id)
+    
+    full_separator_bytes = separator_start_bytes + tech_data_bytes + separator_end_bytes
+    return _bytes_to_6bit_chunks(full_separator_bytes)
+
+
 
 def six_bit_chunks_to_bytes(six_bit_chunks):
     """Converts a sequence of 6-bit chunks back into 8-bit bytes."""
@@ -209,45 +245,80 @@ def decode_image(image):
             six_bit_value = find_nearest_color_index(pixel_color_np, palette_np)
             six_bit_chunks.append(six_bit_value)
 
-    print(f"First 20 six_bit_chunks: {six_bit_chunks[:20]}", file=sys.stderr)
-    print(f"Last 20 six_bit_chunks: {six_bit_chunks[-20:]}", file=sys.stderr)
     print(f"Length of six_bit_chunks: {len(six_bit_chunks)}", file=sys.stderr)
 
-    # Find the separator sequence to determine the actual end of data
-    try:
-        # The separator is a sequence of SEPARATOR_LENGTH (4) instances of SEPARATOR_VALUE (63)
-        separator_index = -1
-        for i in range(len(six_bit_chunks) - SEPARATOR_LENGTH + 1):
-            if all(six_bit_chunks[i + k] == SEPARATOR_VALUE for k in range(SEPARATOR_LENGTH)):
-                separator_index = i
-                break
-        
-        if separator_index != -1:
-            # Data is everything before the separator
-            data_six_bit_chunks = six_bit_chunks[:separator_index]
-        else:
-            # If no separator is found, it means the data filled the entire image
-            # or the separator was truncated. In this case, we assume all chunks are data.
-            data_six_bit_chunks = six_bit_chunks
-            print("Warning: Separator not found. Assuming all data is original content.", file=sys.stderr)
+    # 1. Extract and parse technical data prefix
+    tech_data_prefix_len = 14 # 10 bytes * 8 bits/byte = 80 bits. 80 bits / 6 bits/chunk = 13.33 -> 14 chunks
+    if len(six_bit_chunks) < tech_data_prefix_len:
+        raise ValueError("Image data is too short to contain technical information prefix.")
+    
+    initial_tech_chunks = six_bit_chunks[:tech_data_prefix_len]
+    initial_tech_bytes = six_bit_chunks_to_bytes(initial_tech_chunks)
 
-    except Exception as e:
-        raise ValueError(f"Error finding separator: {e}")
+    if len(initial_tech_bytes) < 3: # We need at least 3 bytes for version, encoding, compressor IDs
+        raise ValueError("Technical information bytes are incomplete.")
+
+    encoder_version = initial_tech_bytes[0]
+    encoding_id = initial_tech_bytes[1]
+    compressor_id = initial_tech_bytes[2]
+
+    print(f"Debug: Extracted Tech Info - Version: {encoder_version}, Encoding ID: {encoding_id}, Compressor ID: {compressor_id}", file=sys.stderr)
+
+    # Dynamically generate FULL_SEPARATOR_CHUNKS and SEPARATOR_LENGTH based on extracted tech info
+    FULL_SEPARATOR_CHUNKS = _generate_full_separator_chunks(encoding_id, compressor_id)
+    SEPARATOR_LENGTH = len(FULL_SEPARATOR_CHUNKS)
+
+    # The actual encoded content starts after the initial technical data prefix
+    content_six_bit_chunks_raw = six_bit_chunks[tech_data_prefix_len:]
+
+    # 2. Find the full separator and extract the actual data
+    data_six_bit_chunks = []
+    current_pos = 0
+    found_separator = False
+
+    while current_pos < len(content_six_bit_chunks_raw):
+        # Check if the full separator is at the current position
+        if content_six_bit_chunks_raw[current_pos : current_pos + SEPARATOR_LENGTH] == FULL_SEPARATOR_CHUNKS:
+            found_separator = True
+            break # Found the first separator, data is everything before it
+        else:
+            data_six_bit_chunks.append(content_six_bit_chunks_raw[current_pos])
+            current_pos += 1
+    
+    if not found_separator:
+        print("Warning: Full separator not found. Assuming all data after tech prefix is original content.", file=sys.stderr)
+        # If no separator is found, it means the data filled the entire image
+        # or the separator was truncated. In this case, we assume all chunks are data.
+        data_six_bit_chunks = content_six_bit_chunks_raw
 
     # Convert 6-bit chunks back to bytes
     decoded_bytes = six_bit_chunks_to_bytes(data_six_bit_chunks)
 
-    # Decompress bytes using lzma
-    try:
-        decompressed_bytes = lzma.decompress(decoded_bytes)
-    except lzma.LZMAError as e:
-        raise ValueError(f"LZMA decompression error: {e}. Data might be corrupted or not LZMA compressed.")
+    # 3. Conditional Decompression and Decoding
+    decompressed_bytes = decoded_bytes
+    if compressor_id == COMPRESSOR_LZMA_ID:
+        try:
+            decompressed_bytes = lzma.decompress(decoded_bytes)
+        except lzma.LZMAError as e:
+            raise ValueError(f"LZMA decompression error: {e}. Data might be corrupted or not LZMA compressed.")
+    elif compressor_id == COMPRESSOR_NONE_ID:
+        pass # No decompression needed
+    else:
+        raise ValueError(f"Unknown compressor ID: {compressor_id}")
 
-    # Decode bytes to text using cp1251
-    try:
-        decoded_text = decompressed_bytes.decode('cp1251')
-    except UnicodeDecodeError:
-        raise ValueError("Could not decode bytes to text using CP-1251. Data might be corrupted or not CP-1251 encoded.")
+    decoded_text = ""
+    if encoding_id == ENCODING_CP1251_ID:
+        try:
+            decoded_text = decompressed_bytes.decode('cp1251')
+        except UnicodeDecodeError:
+            raise ValueError("Could not decode bytes to text using CP-1251. Data might be corrupted or not CP-1251 encoded.")
+    elif encoding_id == ENCODING_UTF8_ID:
+        try:
+            decoded_text = decompressed_bytes.decode('utf-8')
+        except UnicodeDecodeError:
+            raise ValueError("Could not decode bytes to text using UTF-8. Data might be corrupted or not UTF-8 encoded.")
+    else:
+        raise ValueError(f"Unknown encoding ID: {encoding_id}")
 
     print(f"Value of decoded_text before return: {repr(decoded_text)}") # New debug line
     return decoded_text
